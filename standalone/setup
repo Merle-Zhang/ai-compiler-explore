@@ -1,0 +1,33 @@
+#!/bin/sh
+
+# Copy and amend the template from
+# https://llvm.org/docs/GettingStarted.html#stand-alone-builds
+
+build_llvm=../../build-llvm
+build_standalone=../../build-standalone
+installprefix=../../install
+llvm=../../llvm-project
+mkdir -p $build_llvm
+mkdir -p $build_standalone
+mkdir -p $installprefix
+
+cmake -G Ninja -S $llvm/llvm -B $build_llvm \
+   -DLLVM_ENABLE_PROJECTS=mlir \
+   -DLLVM_BUILD_EXAMPLES=ON \
+   -DLLVM_TARGETS_TO_BUILD="Native;NVPTX;AMDGPU" \
+   -DLLVM_ENABLE_ASSERTIONS=ON \
+   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_ENABLE_LLD=ON \
+   -DCMAKE_BUILD_TYPE=Release \
+   -DLLVM_CCACHE_BUILD=ON \
+   -DLLVM_INSTALL_UTILS=ON \
+   -DCMAKE_INSTALL_PREFIX=$installprefix
+
+ninja -C $build_llvm install
+
+cmake -G Ninja -S . -B $build_standalone \
+    -DMLIR_DIR=$installprefix/lib/cmake/mlir \
+    -DLLVM_EXTERNAL_LIT=$build_llvm/bin/llvm-lit
+
+ninja -C $build_standalone check-standalone
+
+ninja -C $build_standalone mlir-doc
