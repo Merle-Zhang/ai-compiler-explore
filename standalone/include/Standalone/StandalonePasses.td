@@ -27,4 +27,11 @@ def StandaloneSwitchBarFoo: Pass<"standalone-switch-bar-foo", "::mlir::ModuleOp"
   }];
 }
 
+def StandaloneSimplifyRedundantFoo: Pass<"standalone-simplify-redundant-foo", "::mlir::ModuleOp"> {
+  let summary = "Simplify two `Foo` into one. Assume Foo(Foo(a)) = a";
+  let description = [{
+    Simplify two `Foo` into one.
+  }];
+}
+
 #endif // STANDALONE_PASS

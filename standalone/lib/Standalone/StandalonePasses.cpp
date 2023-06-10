@@ -15,6 +15,7 @@
 
 namespace mlir::standalone {
 #define GEN_PASS_DEF_STANDALONESWITCHBARFOO
+#define GEN_PASS_DEF_STANDALONESIMPLIFYREDUNDANTFOO
 #include "Standalone/StandalonePasses.h.inc"
 
 namespace {
@@ -42,6 +43,36 @@ public:
     FrozenRewritePatternSet patternSet(std::move(patterns));
     if (failed(applyPatternsAndFoldGreedily(getOperation(), patternSet)))
       signalPassFailure();
+  }
+};
+
+class StandaloneSimplifyRedundantFooRewriter : public OpRewritePattern<FooOp> {
+public:
+  using OpRewritePattern<FooOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(FooOp op,
+                                PatternRewriter &rewriter) const final {
+    mlir::Value fooInput = op.getOperand();
+    FooOp fooInputOp = fooInput.getDefiningOp<FooOp>();
+
+    if (!fooInputOp)
+      return failure();
+
+    rewriter.replaceOp(op, {fooInputOp.getOperand()});
+    return success();
+  }
+};
+
+class StandaloneSimplifyRedundantFoo
+    : public impl::StandaloneSimplifyRedundantFooBase<StandaloneSimplifyRedundantFoo> {
+public:
+  using impl::StandaloneSimplifyRedundantFooBase<
+      StandaloneSimplifyRedundantFoo>::StandaloneSimplifyRedundantFooBase;
+  void runOnOperation() final {
+    RewritePatternSet patterns(&getContext());
+    patterns.add<StandaloneSimplifyRedundantFooRewriter>(&getContext());
+    FrozenRewritePatternSet patternSet(std::move(patterns));
+    if (failed(applyPatternsAndFoldGreedily(getOperation(), patternSet)))
+        signalPassFailure();
   }
 };
 } // namespace
