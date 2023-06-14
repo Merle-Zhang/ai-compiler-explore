@@ -150,7 +150,7 @@ We also need to add `set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})` to `triton/CMakeL
 
 Then you can use `ninja -C $build_triton mlir-doc` as shown in the above script. The generated docs will be under `$build_triton/docs`
 
-> TODO: Give an example commit showing which file can be changed.
+Feel free to look at the example commit for more information: [29d4f90e0460](https://github.com/Merle-Zhang/triton/commit/29d4f90e0460bb5ba578f1fea3ad0b0d71eca5fe)
 
 ###  1.4. <a name='RegressionTest'></a>Regression Test
 
