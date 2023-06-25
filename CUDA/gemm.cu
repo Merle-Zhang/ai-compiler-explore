@@ -88,7 +88,7 @@ __global__ void gpu_gemm_sh_nn(int n, float alpha, const float *__restrict__ A,
         __syncthreads();
 
         // Multiply two loaded tiles to produce a tile of matrix
-        // C(x_pos:TILE_EXT_M, y_pos:TILE_EXT_N):
+        // C(x_pos:TILE_EXT_X, y_pos:TILE_EXT_Y):
         if (x_pos + threadIdx.x < n && y_pos + threadIdx.y < n) {
           // number of loop iterations is known at compile time: Unroll it
           if (k_end - k_pos == TILE_EXT_K) {
@@ -116,6 +116,184 @@ __global__ void gpu_gemm_sh_nn(int n, float alpha, const float *__restrict__ A,
 
   }  // y_pos
 
+  return;
+}
+
+template <int TILE_EXT_Y = 32, int TILE_EXT_X = 32, int TILE_EXT_K = 16>
+__global__ void gpu_gemm_sh_reg_nn(int n, float alpha,
+                                   const float *__restrict__ A,
+                                   const float *__restrict__ B, float beta,
+                                   float *__restrict__ C) {
+  __shared__ float abuf[TILE_EXT_K][TILE_EXT_X], bbuf[TILE_EXT_Y][TILE_EXT_K];
+
+  // tile offset in Y dimension
+  for (int y_pos = blockIdx.y * TILE_EXT_Y; y_pos < n;
+       y_pos += gridDim.y * TILE_EXT_Y) {
+    int y_end = y_pos + TILE_EXT_Y;
+    if (y_end > n) {
+      y_end = n;
+    }
+
+    // tile offset in X dimension
+    for (int x_pos = blockIdx.x * TILE_EXT_X; x_pos < n;
+         x_pos += gridDim.x * TILE_EXT_X) {
+      int x_end = x_pos + TILE_EXT_X;
+      if (x_end > n) {
+        x_end = n;
+      }
+
+      // complete tile C(TILE_EXT_X, TILE_EXT_Y)
+      if ((x_end - x_pos == TILE_EXT_X) && (y_end - y_pos == TILE_EXT_Y)) {
+        // Initialize registers to zero:
+        float creg[4][4] = {0};
+        float breg[4] = {0};
+        float areg[4] = {0};
+
+        // k_pos is the position of the CUDA thread along the K dimension
+        for (int k_pos = 0; k_pos < n; k_pos += TILE_EXT_K) {
+          int k_end = k_pos + TILE_EXT_K;
+          if (k_end > n) {
+            k_end = n;
+          }
+
+          // Load a tile of matrix A(x_pos:TILE_EXT_X, k_pos:TILE_EXT_K):
+          for (int x_loc = x_pos + threadIdx.x; x_loc < x_end;
+               x_loc += blockDim.x) {
+            for (int k_loc = k_pos + threadIdx.y; k_loc < k_end;
+                 k_loc += blockDim.y) {
+              abuf[k_loc - k_pos][x_loc - x_pos] = A[k_loc * n + x_loc];
+            }
+          }
+
+          // Load a tile of matrix B(k_pos:TILE_EXT_K, y_pos:TILE_EXT_Y):
+          for (int y_loc = y_pos + threadIdx.y; y_loc < y_end;
+               y_loc += blockDim.y) {
+            for (int k_loc = k_pos + threadIdx.x; k_loc < k_end;
+                 k_loc += blockDim.x) {
+              bbuf[y_loc - y_pos][k_loc - k_pos] = B[y_loc * n + k_loc];
+            }
+          }
+          __syncthreads();
+
+          // Multiply two loaded tiles to produce a tile of matrix
+          // C(x_pos:TILE_EXT_X, y_pos:TILE_EXT_Y):
+          if (k_end - k_pos == TILE_EXT_K) {
+#pragma unroll
+            for (int l = 0; l < TILE_EXT_K; ++l) {
+#pragma unroll
+              for (int j = 0; j < 4; ++j)
+                breg[j] = bbuf[threadIdx.y + blockDim.y * j][l];
+#pragma unroll
+              for (int j = 0; j < 4; ++j)
+                areg[j] = abuf[l][threadIdx.x + blockDim.x * j];
+#pragma unroll
+              for (int j = 0; j < 4; ++j) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                  creg[j][i] += areg[i] * breg[j];
+                }
+              }
+            }
+          } else {
+            for (int l = 0; l < (k_end - k_pos); ++l) {
+#pragma unroll
+              for (int j = 0; j < 4; ++j)
+                breg[j] = bbuf[threadIdx.y + blockDim.y * j][l];
+#pragma unroll
+              for (int j = 0; j < 4; ++j)
+                areg[j] = abuf[l][threadIdx.x + blockDim.x * j];
+#pragma unroll
+              for (int j = 0; j < 4; ++j) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                  creg[j][i] += areg[i] * breg[j];
+                }
+              }
+            }
+          }
+          __syncthreads();
+
+        }  // k_pos
+
+        // Store elements of the C matrix in global memory:
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            int c_offset = (y_pos + threadIdx.y + blockDim.y * j) * n +
+                           (x_pos + threadIdx.x + blockDim.x * i);
+            C[c_offset] = alpha * creg[j][i] + beta * C[c_offset];
+          }
+        }
+
+      } else {  // incomplete tile of C
+
+        // Initialize registers to zero:
+        float creg[4][4] = {0};
+        float breg[4] = {0};
+        float areg[4] = {0};
+
+        // k_pos is the position of the CUDA thread along the K dimension
+        for (int k_pos = 0; k_pos < n; k_pos += TILE_EXT_K) {
+          int k_end = k_pos + TILE_EXT_K;
+          if (k_end > n) {
+            k_end = n;
+          }
+
+          // Load a tile of matrix A(x_pos:TILE_EXT_X, k_pos:TILE_EXT_K):
+          for (int x_loc = x_pos + threadIdx.x; x_loc < x_end;
+               x_loc += blockDim.x) {
+            for (int k_loc = k_pos + threadIdx.y; k_loc < k_end;
+                 k_loc += blockDim.y) {
+              abuf[k_loc - k_pos][x_loc - x_pos] = A[k_loc * n + x_loc];
+            }
+          }
+
+          // Load a tile of matrix B(k_pos:TILE_EXT_K, y_pos:TILE_EXT_Y):
+          for (int y_loc = y_pos + threadIdx.y; y_loc < y_end;
+               y_loc += blockDim.y) {
+            for (int k_loc = k_pos + threadIdx.x; k_loc < k_end;
+                 k_loc += blockDim.x) {
+              bbuf[y_loc - y_pos][k_loc - k_pos] = B[y_loc * n + k_loc];
+            }
+          }
+          __syncthreads();
+
+          // Multiply two loaded tiles to produce a tile of matrix
+          // C(x_pos:TILE_EXT_X,y_pos:TILE_EXT_Y):
+          for (int l = 0; l < (k_end - k_pos); ++l) {
+            for (int i = 0, j = threadIdx.y; j < y_end - y_pos;
+                 j += blockDim.y, i++)
+              breg[i] = bbuf[j][l];
+            for (int i = 0, j = threadIdx.x; j < x_end - x_pos;
+                 j += blockDim.x, i++)
+              areg[i] = abuf[l][j];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+#pragma unroll
+              for (int i = 0; i < 4; ++i) {
+                creg[j][i] += areg[i] * breg[j];
+              }
+            }
+          }
+          __syncthreads();
+
+        }  // k_pos
+
+        // Store element of the C matrix in global memory:
+        for (int j = 0, y_loc = y_pos + threadIdx.y; y_loc < y_end;
+             y_loc += blockDim.y, j++) {
+          for (int i = 0, x_loc = x_pos + threadIdx.x; x_loc < x_end;
+               x_loc += blockDim.x, i++) {
+            int c_offset = y_loc * n + x_loc;
+            C[c_offset] = alpha * creg[j][i] + beta * C[c_offset];
+          }
+        }
+      }
+
+    }  // x_pos
+
+  }  // y_pos
   return;
 }
 
@@ -239,6 +417,44 @@ int main(int argc, char **argv) {
 
   /************shared memory***********/
   printf("********shared memory********\n");
+
+  tstart_total = clock();
+
+  tstart = clock();
+  // dim3 threads(32, 32);
+  // dim3 blocks((N - 1) / 32 + 1, (N - 1) / 32 + 1);
+  gpu_gemm_sh_nn<<<blocks, threads>>>(N, alpha, d_A, d_B, beta, d_C);
+  cudaDeviceSynchronize();
+  tend = clock();
+  gpu_duration = ((float)(tend - tstart)) / CLOCKS_PER_SEC;
+  printf("Kernel time for sum on GPU: %f seconds\n", gpu_duration);
+
+  // h_C = (float *)malloc(n2 * sizeof(h_C[0]));
+  checkCudaErrors(cublasGetVector(n2, sizeof(h_C[0]), d_C, 1, h_C, 1));
+  cudaDeviceSynchronize();
+  tend = clock();
+  gpu_duration = ((float)(tend - tstart_total)) / CLOCKS_PER_SEC;
+  printf("Total time for sum on GPU: %f seconds\n", gpu_duration);
+
+  printf("speed-up: %.1f\n", cpu_duration / gpu_duration);
+
+  /************Check correctness using RMS Error ***********/
+  error_norm = 0;
+  ref_norm = 0;
+
+  for (i = 0; i < n2; ++i) {
+    diff = h_C_ref[i] - h_C[i];
+    error_norm += diff * diff;
+    ref_norm += h_C_ref[i] * h_C_ref[i];
+  }
+
+  error_norm = (float)sqrt((double)error_norm / n2);
+  ref_norm = (float)sqrt((double)ref_norm);
+
+  printf("Error %f, reference %f\n", error_norm, ref_norm);
+
+  /************shared memory and register***********/
+  printf("********shared memory and register********\n");
 
   tstart_total = clock();
 
