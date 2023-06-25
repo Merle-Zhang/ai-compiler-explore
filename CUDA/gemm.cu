@@ -42,9 +42,81 @@ __global__ void gpu_gemm(int n, float alpha, const float *__restrict__ A,
         prod += A[k * n + i] * B[j * n + k];
       }
 
-      C[j * n + i] += alpha * prod * beta * C[j * n + i];
+      C[j * n + i] = alpha * prod + beta * C[j * n + i];
     }
   }
+}
+
+template <int TILE_EXT_Y = 32, int TILE_EXT_X = 32, int TILE_EXT_K = 64>
+__global__ void gpu_gemm_sh_nn(int n, float alpha, const float *__restrict__ A,
+                               const float *__restrict__ B, float beta,
+                               float *__restrict__ C) {
+  __shared__ float abuf[TILE_EXT_K][TILE_EXT_X], bbuf[TILE_EXT_Y][TILE_EXT_K];
+
+  // tile offset in Y
+  for (int y_pos = blockIdx.y * blockDim.y; y_pos < n;
+       y_pos += gridDim.y * blockDim.y) {
+    // tile offset in X
+    for (int x_pos = blockIdx.x * blockDim.x; x_pos < n;
+         x_pos += gridDim.x * blockDim.x) {
+      float tmp = 0.0;  // accumulator
+
+      // k_pos is the position of the CUDA thread along the K dimension
+      for (int k_pos = 0; k_pos < n; k_pos += TILE_EXT_K) {
+        int k_end = k_pos + TILE_EXT_K;
+        if (k_end > n) {
+          k_end = n;
+        }
+
+        // Load a tile of matrix A(x_pos:TILE_EXT_X, k_pos:TILE_EXT_K):
+        if (x_pos + threadIdx.x < n) {
+          for (int k_loc = k_pos + threadIdx.y; k_loc < k_end;
+               k_loc += blockDim.y) {
+            abuf[k_loc - k_pos][threadIdx.x] =
+                A[k_loc * n + (x_pos + threadIdx.x)];
+          }
+        }
+
+        // Load a tile of matrix B(k_pos:TILE_EXT_K, y_pos:TILE_EXT_Y):
+        if (y_pos + threadIdx.y < n) {
+          for (int k_loc = k_pos + threadIdx.x; k_loc < k_end;
+               k_loc += blockDim.x) {
+            bbuf[threadIdx.y][k_loc - k_pos] =
+                B[(y_pos + threadIdx.y) * n + k_loc];
+          }
+        }
+        __syncthreads();
+
+        // Multiply two loaded tiles to produce a tile of matrix
+        // C(x_pos:TILE_EXT_M, y_pos:TILE_EXT_N):
+        if (x_pos + threadIdx.x < n && y_pos + threadIdx.y < n) {
+          // number of loop iterations is known at compile time: Unroll it
+          if (k_end - k_pos == TILE_EXT_K) {
+#pragma unroll
+            for (int l = 0; l < TILE_EXT_K; ++l) {
+              tmp += abuf[l][threadIdx.x] * bbuf[threadIdx.y][l];
+            }
+          } else {  // number of loop iterations is not known at compile time
+            for (int l = 0; l < (k_end - k_pos); ++l) {
+              tmp += abuf[l][threadIdx.x] * bbuf[threadIdx.y][l];
+            }
+          }
+        }
+        __syncthreads();
+
+      }  // k_pos
+
+      // Store element of the C matrix in global memory:
+      if (x_pos + threadIdx.x < n && y_pos + threadIdx.y < n) {
+        int c_offset = (y_pos + threadIdx.y) * n + (x_pos + threadIdx.x);
+        C[c_offset] = alpha * tmp + beta * C[c_offset];
+      }
+
+    }  // x_pos
+
+  }  // y_pos
+
+  return;
 }
 
 int main(int argc, char **argv) {
@@ -128,6 +200,7 @@ int main(int argc, char **argv) {
   printf("Error %f, reference %f\n", error_norm, ref_norm);
 
   /************My Kernel***********/
+  printf("********My Kernal********\n");
 
   tstart_total = clock();
 
@@ -140,7 +213,7 @@ int main(int argc, char **argv) {
   gpu_duration = ((float)(tend - tstart)) / CLOCKS_PER_SEC;
   printf("Kernel time for sum on GPU: %f seconds\n", gpu_duration);
 
-  h_C = (float *)malloc(n2 * sizeof(h_C[0]));
+  // h_C = (float *)malloc(n2 * sizeof(h_C[0]));
   checkCudaErrors(cublasGetVector(n2, sizeof(h_C[0]), d_C, 1, h_C, 1));
   cudaDeviceSynchronize();
   tend = clock();
@@ -163,6 +236,46 @@ int main(int argc, char **argv) {
   ref_norm = (float)sqrt((double)ref_norm);
 
   printf("Error %f, reference %f\n", error_norm, ref_norm);
+
+  /************shared memory***********/
+  printf("********shared memory********\n");
+
+  tstart_total = clock();
+
+  tstart = clock();
+  // dim3 threads(32, 32);
+  // dim3 blocks((N - 1) / 32 + 1, (N - 1) / 32 + 1);
+  gpu_gemm_sh_nn<<<blocks, threads>>>(N, alpha, d_A, d_B, beta, d_C);
+  cudaDeviceSynchronize();
+  tend = clock();
+  gpu_duration = ((float)(tend - tstart)) / CLOCKS_PER_SEC;
+  printf("Kernel time for sum on GPU: %f seconds\n", gpu_duration);
+
+  // h_C = (float *)malloc(n2 * sizeof(h_C[0]));
+  checkCudaErrors(cublasGetVector(n2, sizeof(h_C[0]), d_C, 1, h_C, 1));
+  cudaDeviceSynchronize();
+  tend = clock();
+  gpu_duration = ((float)(tend - tstart_total)) / CLOCKS_PER_SEC;
+  printf("Total time for sum on GPU: %f seconds\n", gpu_duration);
+
+  printf("speed-up: %.1f\n", cpu_duration / gpu_duration);
+
+  /************Check correctness using RMS Error ***********/
+  error_norm = 0;
+  ref_norm = 0;
+
+  for (i = 0; i < n2; ++i) {
+    diff = h_C_ref[i] - h_C[i];
+    error_norm += diff * diff;
+    ref_norm += h_C_ref[i] * h_C_ref[i];
+  }
+
+  error_norm = (float)sqrt((double)error_norm / n2);
+  ref_norm = (float)sqrt((double)ref_norm);
+
+  printf("Error %f, reference %f\n", error_norm, ref_norm);
+
+  /************Cleaning up ***********/
 
   free(h_A);
   free(h_B);
